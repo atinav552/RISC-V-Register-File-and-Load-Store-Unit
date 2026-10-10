@@ -23,8 +23,8 @@ module riscv_regfile (
 
     // Asynchronous Read (RISC-V standard)
     // Register 0 (x0) is hardwired to 0.
-    assign rdata1 = (rs1 == 5'b00000) ? 32'd0 : registers[rs1];
-    assign rdata2 = (rs2 == 5'b00000) ? 32'd0 : registers[rs2];
+    assign rdata1 = (rs1 == 5'b00000) ? 32'd0 : ((we && (rs1 == rd)) ? wdata : registers[rs1]);
+    assign rdata2 = (rs2 == 5'b00000) ? 32'd0 : ((we && (rs2 == rd)) ? wdata : registers[rs2]);
 
     // Synchronous Write
     always @(posedge clk or negedge rst_n) begin

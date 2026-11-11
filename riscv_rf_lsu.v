@@ -58,7 +58,9 @@ module riscv_lsu (
     output reg         addr_fault,  // Unaligned address exception
     output wire        stall,       // Pipeline stall signal
     
-    // Main Memory Interface (Simulated 32-bit aligned memory)
+    // Main Memory Interface (32-bit aligned)
+    output wire        mem_valid,   // Valid transaction request to memory
+    output wire        mem_we_out,  // Write enable to memory
     output wire [31:0] mem_addr,
     output reg  [31:0] mem_wdata,
     output reg  [3:0]  mem_byte_en,
@@ -66,11 +68,53 @@ module riscv_lsu (
     input  wire        mem_ready
 );
 
-    // Memory address is always word-aligned (drops bottom 2 bits)
-    assign mem_addr = {addr[31:2], 2'b00};
+    // FSM States for tracking multi-cycle memory accesses
+    localparam IDLE     = 2'b00,
+               WAIT_MEM = 2'b01,
+               FAULT    = 2'b10;
+
+    reg [1:0] state, next_state;
+
+    // Word-aligned memory address
+    assign mem_addr   = {addr[31:2], 2'b00};
     
-    // Stall the pipeline if memory is requested but not ready
-    assign stall = mem_req && !mem_ready;
+    // Only issue a request to memory if there is no alignment fault
+    assign mem_valid  = mem_req && !addr_fault && (state != FAULT);
+    assign mem_we_out = mem_valid && mem_we;
+
+    // Stall the pipeline if a valid memory request is still waiting on mem_ready
+    assign stall      = mem_valid && !mem_ready;
+
+    // Sequential State Register
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            state <= IDLE;
+        else
+            state <= next_state;
+    end
+
+    // Next-State Logic
+    always @(*) begin
+        next_state = state;
+        case (state)
+            IDLE: begin
+                if (mem_req) begin
+                    if (addr_fault)
+                        next_state = FAULT;
+                    else if (!mem_ready)
+                        next_state = WAIT_MEM;
+                end
+            end
+            WAIT_MEM: begin
+                if (mem_ready)
+                    next_state = IDLE;
+            end
+            FAULT: begin
+                next_state = IDLE; // Clear fault state on next cycle as trap handler takes over
+            end
+            default: next_state = IDLE;
+        endcase
+    end
 
     // Fault Detection & Byte Enable/Data Alignment Logic
     always @(*) begin
@@ -82,7 +126,6 @@ module riscv_lsu (
         if (mem_req) begin
             case (size)
                 2'b00: begin // BYTE (8-bit)
-                    // No alignment faults for single bytes
                     if (mem_we) begin
                         case (addr[1:0])
                             2'b00: begin mem_byte_en = 4'b0001; mem_wdata = {24'd0, wdata[7:0]}; end
@@ -127,7 +170,7 @@ module riscv_lsu (
                     end
                 end
                 
-                default: addr_fault = 1'b0;
+                default: addr_fault = 1'b1; // Invalid size encoding triggers fault
             endcase
         end
     end

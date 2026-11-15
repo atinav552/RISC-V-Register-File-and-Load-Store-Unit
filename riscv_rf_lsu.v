@@ -18,21 +18,22 @@ module riscv_regfile (
     output wire [31:0] rdata2    // Read Data 2
 );
 
-    reg [31:0] registers [0:31];
+    // Allocate only x1 through x31 (x0 is hardwired constant 0, saving 32 FFs)
+    reg [31:0] registers [1:31];
     integer i;
 
-    // Asynchronous Read (RISC-V standard)
-    // Register 0 (x0) is hardwired to 0.
-    assign rdata1 = (rs1 == 5'b00000) ? 32'd0 : ((we && (rs1 == rd)) ? wdata : registers[rs1]);
-    assign rdata2 = (rs2 == 5'b00000) ? 32'd0 : ((we && (rs2 == rd)) ? wdata : registers[rs2]);
+    // Asynchronous Read with Same-Cycle Write-Through Bypass
+    // Checking (rsX == 5'd0) first prevents writes to x0 from bypassing non-zero wdata
+    assign rdata1 = (rs1 == 5'd0) ? 32'd0 : ((we && (rs1 == rd)) ? wdata : registers[rs1]);
+    assign rdata2 = (rs2 == 5'd0) ? 32'd0 : ((we && (rs2 == rd)) ? wdata : registers[rs2]);
 
-    // Synchronous Write
+    // Synchronous Write (Ignores writes targeting x0)
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             for (i = 1; i < 32; i = i + 1) begin
                 registers[i] <= 32'd0;
             end
-        end else if (we && (rd != 5'b00000)) begin
+        end else if (we && (rd != 5'd0)) begin
             registers[rd] <= wdata;
         end
     end
@@ -47,20 +48,20 @@ module riscv_lsu (
     input  wire        rst_n,
     
     // CPU Core Interface
-    input  wire        mem_req,     // Request active
-    input  wire        mem_we,      // 0 = Load, 1 = Store
-    input  wire [1:0]  size,        // 00=Byte, 01=Halfword, 10=Word
-    input  wire        l_unsigned,  // 1 = Zero extend, 0 = Sign extend (for loads)
-    input  wire [31:0] addr,        // Target memory address
-    input  wire [31:0] wdata,       // Data to store
+    input  wire        mem_req,    // Request active
+    input  wire        mem_we,     // 0 = Load, 1 = Store
+    input  wire [1:0]  size,       // 00=Byte, 01=Halfword, 10=Word
+    input  wire        l_unsigned, // 1 = Zero extend, 0 = Sign extend (for loads)
+    input  wire [31:0] addr,       // Target memory address
+    input  wire [31:0] wdata,      // Data to store
     
-    output reg  [31:0] rdata,       // Data loaded to CPU
-    output reg         addr_fault,  // Unaligned address exception
-    output wire        stall,       // Pipeline stall signal
+    output reg  [31:0] rdata,      // Data loaded to CPU
+    output reg         addr_fault, // Unaligned address exception
+    output wire        stall,      // Pipeline stall signal
     
     // Main Memory Interface (32-bit aligned)
-    output wire        mem_valid,   // Valid transaction request to memory
-    output wire        mem_we_out,  // Write enable to memory
+    output wire        mem_valid,  // Valid transaction request to memory
+    output wire        mem_we_out, // Write enable to memory
     output wire [31:0] mem_addr,
     output reg  [31:0] mem_wdata,
     output reg  [3:0]  mem_byte_en,
@@ -68,21 +69,23 @@ module riscv_lsu (
     input  wire        mem_ready
 );
 
-    // FSM States for tracking multi-cycle memory accesses
+    // FSM States for tracking multi-cycle memory accesses & exceptions
     localparam IDLE     = 2'b00,
                WAIT_MEM = 2'b01,
                FAULT    = 2'b10;
 
-    reg [1:0] state, next_state;
+    reg [1:0]  state, next_state;
+    reg [7:0]  selected_byte;
+    reg [15:0] selected_half;
 
     // Word-aligned memory address
     assign mem_addr   = {addr[31:2], 2'b00};
     
-    // Only issue a request to memory if there is no alignment fault
+    // Issue a request to memory only if there is no alignment fault
     assign mem_valid  = mem_req && !addr_fault && (state != FAULT);
     assign mem_we_out = mem_valid && mem_we;
 
-    // Stall the pipeline if a valid memory request is still waiting on mem_ready
+    // Stall the pipeline if a valid memory request is waiting on mem_ready
     assign stall      = mem_valid && !mem_ready;
 
     // Sequential State Register
@@ -116,7 +119,19 @@ module riscv_lsu (
         endcase
     end
 
-    // Fault Detection & Byte Enable/Data Alignment Logic
+    // Shared Byte & Halfword Extraction Muxes for Loads (Reduces LUT/Mux Area)
+    always @(*) begin
+        case (addr[1:0])
+            2'b00: selected_byte = mem_rdata[7:0];
+            2'b01: selected_byte = mem_rdata[15:8];
+            2'b10: selected_byte = mem_rdata[23:16];
+            2'b11: selected_byte = mem_rdata[31:24];
+        endcase
+
+        selected_half = addr[1] ? mem_rdata[31:16] : mem_rdata[15:0];
+    end
+
+    // Fault Detection, Byte-Enable Steering & Sign/Zero Extension Logic
     always @(*) begin
         addr_fault  = 1'b0;
         mem_byte_en = 4'b0000;
@@ -127,19 +142,10 @@ module riscv_lsu (
             case (size)
                 2'b00: begin // BYTE (8-bit)
                     if (mem_we) begin
-                        case (addr[1:0])
-                            2'b00: begin mem_byte_en = 4'b0001; mem_wdata = {24'd0, wdata[7:0]}; end
-                            2'b01: begin mem_byte_en = 4'b0010; mem_wdata = {16'd0, wdata[7:0], 8'd0}; end
-                            2'b10: begin mem_byte_en = 4'b0100; mem_wdata = {8'd0, wdata[7:0], 16'd0}; end
-                            2'b11: begin mem_byte_en = 4'b1000; mem_wdata = {wdata[7:0], 24'd0}; end
-                        endcase
+                        mem_byte_en = 4'b0001 << addr[1:0];
+                        mem_wdata   = {24'd0, wdata[7:0]} << {addr[1:0], 3'b000};
                     end else begin
-                        case (addr[1:0])
-                            2'b00: rdata = l_unsigned ? {24'd0, mem_rdata[7:0]}   : {{24{mem_rdata[7]}}, mem_rdata[7:0]};
-                            2'b01: rdata = l_unsigned ? {24'd0, mem_rdata[15:8]}  : {{24{mem_rdata[15]}}, mem_rdata[15:8]};
-                            2'b10: rdata = l_unsigned ? {24'd0, mem_rdata[23:16]} : {{24{mem_rdata[23]}}, mem_rdata[23:16]};
-                            2'b11: rdata = l_unsigned ? {24'd0, mem_rdata[31:24]} : {{24{mem_rdata[31]}}, mem_rdata[31:24]};
-                        endcase
+                        rdata = {{24{~l_unsigned & selected_byte[7]}}, selected_byte};
                     end
                 end
 
@@ -147,15 +153,10 @@ module riscv_lsu (
                     if (addr[0] != 1'b0) begin
                         addr_fault = 1'b1; // Unaligned halfword fault
                     end else if (mem_we) begin
-                        case (addr[1])
-                            1'b0: begin mem_byte_en = 4'b0011; mem_wdata = {16'd0, wdata[15:0]}; end
-                            1'b1: begin mem_byte_en = 4'b1100; mem_wdata = {wdata[15:0], 16'd0}; end
-                        endcase
+                        mem_byte_en = addr[1] ? 4'b1100 : 4'b0011;
+                        mem_wdata   = addr[1] ? {wdata[15:0], 16'd0} : {16'd0, wdata[15:0]};
                     end else begin
-                        case (addr[1])
-                            1'b0: rdata = l_unsigned ? {16'd0, mem_rdata[15:0]}  : {{16{mem_rdata[15]}}, mem_rdata[15:0]};
-                            1'b1: rdata = l_unsigned ? {16'd0, mem_rdata[31:16]} : {{16{mem_rdata[31]}}, mem_rdata[31:16]};
-                        endcase
+                        rdata = {{16{~l_unsigned & selected_half[15]}}, selected_half};
                     end
                 end
 
@@ -170,7 +171,7 @@ module riscv_lsu (
                     end
                 end
                 
-                default: addr_fault = 1'b1; // Invalid size encoding triggers fault
+                default: addr_fault = 1'b1; // Invalid size encoding (2'b11) triggers fault
             endcase
         end
     end
